@@ -122,6 +122,22 @@ body {
   position: relative;
 }
 
+.square.dragging { opacity: 0.25; transition: opacity 0.15s; }
+
+.square.drag-hover {
+  box-shadow: inset 0 0 14px rgba(255, 255, 100, 0.5);
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: scale(0.6); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+.square.legal-move::after,
+.square.legal-capture::after {
+  animation: fadeIn 0.12s ease-out;
+}
+
 .loading-overlay {
   display: none;
   position: absolute;
@@ -315,13 +331,13 @@ button:disabled { opacity: 0.4; cursor: default; background: #3a3a5c; }
   </div>
   <div class="sidebar">
     <div class="difficulty">
-      <label>Search Depth</label>
+      <label>Difficulty</label>
       <div class="slider-row">
         <span>1</span>
-        <input type="range" id="depthSlider" min="1" max="4" value="3">
-        <span>4</span>
+        <input type="range" id="depthSlider" min="1" max="20" value="10">
+        <span>20</span>
       </div>
-      <div id="depthValue">3</div>
+      <div id="depthValue">10</div>
     </div>
     <div class="history-panel">
       <div class="history-title">Move History</div>
@@ -339,10 +355,8 @@ const UNICODE = {
   P: { w: '\u2659', b: '\u265F' },
 };
 
-const PIECE_VALUES = { P: 100, N: 320, B: 330, R: 500, Q: 900, K: 0 };
-
 let board, turn, castling, enPassant, selected, legalMoves, gameOver;
-let moveHistory, gameStates, aiDepth;
+let moveHistory, gameStates, stockfishSkill;
 
 function cloneBoard(b) {
   return b.map(r => r.map(c => c ? { ...c } : null));
@@ -568,51 +582,45 @@ function applyMove(b, fromRow, fromCol, toRow, toCol, c, ep) {
   return { board: nb, castling: newC, enPassant: newEP };
 }
 
-function evaluate(b) {
-  let score = 0;
-  for (let r = 0; r < 8; r++)
-    for (let c = 0; c < 8; c++)
-      if (b[r][c])
-        score += b[r][c].color === 'b' ? PIECE_VALUES[b[r][c].type] : -PIECE_VALUES[b[r][c].type];
-  return score;
+const FILES = 'abcdefgh';
+const RANKS = '87654321';
+
+function boardToFen(b, t, c, ep) {
+  let fen = '';
+  for (let r = 0; r < 8; r++) {
+    if (r > 0) fen += '/';
+    let empty = 0;
+    for (let f = 0; f < 8; f++) {
+      const p = b[r][f];
+      if (p) {
+        if (empty > 0) { fen += empty; empty = 0; }
+        fen += p.color === 'w' ? p.type.toUpperCase() : p.type.toLowerCase();
+      } else {
+        empty++;
+      }
+    }
+    if (empty > 0) fen += empty;
+  }
+  fen += ' ' + t + ' ';
+  let cs = '';
+  if (c.K) cs += 'K';
+  if (c.Q) cs += 'Q';
+  if (c.k) cs += 'k';
+  if (c.q) cs += 'q';
+  fen += cs || '-';
+  fen += ' ';
+  if (ep) fen += FILES[ep.col] + RANKS[ep.row];
+  else fen += '-';
+  fen += ' 0 1';
+  return fen;
 }
 
-function minimax(b, depth, alpha, beta, maximizing, c, ep, maxDepth) {
-  if (depth === 0) return { score: evaluate(b) };
-
-  const color = maximizing ? 'b' : 'w';
-  const moves = getAllMoves(b, color, c, ep);
-
-  if (moves.length === 0) {
-    if (isInCheck(b, color))
-      return { score: maximizing ? -99999 + (maxDepth - depth) : 99999 - (maxDepth - depth) };
-    return { score: 0 };
-  }
-
-  let best = null;
-
-  if (maximizing) {
-    let maxScore = -Infinity;
-    for (const m of moves) {
-      const r = applyMove(b, m.fromRow, m.fromCol, m.toRow, m.toCol, c, ep);
-      const { score } = minimax(r.board, depth - 1, alpha, beta, false, r.castling, r.enPassant, maxDepth);
-      if (score > maxScore) { maxScore = score; best = m; }
-      alpha = Math.max(alpha, score);
-      if (beta <= alpha) break;
-    }
-    return depth === maxDepth ? { score: maxScore, move: best } : { score: maxScore };
-  } else {
-    let minScore = Infinity;
-    for (const m of moves) {
-      const r = applyMove(b, m.fromRow, m.fromCol, m.toRow, m.toCol, c, ep);
-      const { score } = minimax(r.board, depth - 1, alpha, beta, true, r.castling, r.enPassant, maxDepth);
-      if (score < minScore) { minScore = score; best = m; }
-      beta = Math.min(beta, score);
-      if (beta <= alpha) break;
-    }
-    return { score: minScore, move: best };
-  }
-}
+let engine = null;
+let engineReady = false;
+let stockfishCallback = null;
+let searching = false;
+let dragSource = null;
+let dragMoves = [];
 
 function showLoading() {
   document.getElementById('loadingOverlay').style.display = 'flex';
@@ -622,15 +630,65 @@ function hideLoading() {
   document.getElementById('loadingOverlay').style.display = 'none';
 }
 
+async function initStockfish() {
+  try {
+    const JS_URL = 'https://unpkg.com/stockfish@18.0.7/bin/stockfish-18-lite-single.js';
+    const workerCode = [
+      `Object.defineProperty(self, 'location', {`,
+      `  get: function() { return new URL('${JS_URL}'); },`,
+      `  configurable: true`,
+      `});`,
+      `importScripts('${JS_URL}');`
+    ].join('\n');
+    const blob = new Blob([workerCode], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    engine = new Worker(url);
+    engine.onmessage = function (e) {
+      const data = typeof e.data === 'string' ? e.data : '';
+      if (data === 'uciok') {
+        engine.postMessage('ucinewgame');
+        engine.postMessage('setoption name Skill Level value ' + stockfishSkill);
+        engineReady = true;
+        return;
+      }
+      if (data.startsWith('bestmove') && stockfishCallback) {
+        stockfishCallback(data);
+        stockfishCallback = null;
+      }
+    };
+    engine.postMessage('uci');
+  } catch (err) {
+    console.error('Stockfish failed to load:', err);
+  }
+}
+
 function aiPlay() {
-  if (gameOver || turn !== 'b') return;
+  if (gameOver || turn !== 'b' || searching) return;
+  if (!engineReady) {
+    setTimeout(aiPlay, 50);
+    return;
+  }
+  searching = true;
   showLoading();
-  setTimeout(() => {
-    const result = minimax(board, aiDepth, -Infinity, Infinity, true, castling, enPassant, aiDepth);
+
+  const fen = boardToFen(board, turn, castling, enPassant);
+  engine.postMessage('position fen ' + fen);
+  engine.postMessage('go movetime 1000');
+
+  stockfishCallback = function (data) {
+    searching = false;
     hideLoading();
-    if (result.move)
-      executeMove(result.move.fromRow, result.move.fromCol, result.move.toRow, result.move.toCol);
-  }, 30);
+    if (gameOver || turn !== 'b') return;
+    const parts = data.split(' ');
+    const move = parts[1];
+    if (move && move !== '(none)') {
+      const fromFile = move.charCodeAt(0) - 97;
+      const fromRank = 8 - parseInt(move[1]);
+      const toFile = move.charCodeAt(2) - 97;
+      const toRank = 8 - parseInt(move[3]);
+      executeMove(fromRank, fromFile, toRank, toFile);
+    }
+  };
 }
 
 function toAlgebraic(fromRow, fromCol, toRow, toCol, piece, captured, isCastle, isEP) {
@@ -734,11 +792,12 @@ function executeMove(fromRow, fromCol, toRow, toCol) {
   document.getElementById('undoBtn').disabled = moveHistory.length < 2;
 
   if (!gameOver && turn === 'b')
-    setTimeout(aiPlay, 80);
+    aiPlay();
 }
 
 function undo() {
   if (moveHistory.length < 2 || gameStates.length < 3) return;
+  if (searching) return;
 
   gameStates.pop();
   gameStates.pop();
@@ -752,6 +811,8 @@ function undo() {
   enPassant = prev.enPassant ? { ...prev.enPassant } : null;
   selected = null;
   legalMoves = [];
+  dragSource = null;
+  dragMoves = [];
   gameOver = false;
 
   renderBoard();
@@ -761,6 +822,7 @@ function undo() {
 
 function handleClick(row, col) {
   if (gameOver || turn !== 'w') return;
+  if (dragSource) { dragSource = null; dragMoves = []; renderBoard(); return; }
   const piece = board[row][col];
 
   if (selected) {
@@ -839,6 +901,12 @@ function renderBoard() {
 
   const legalSet = new Set(legalMoves.map(m => `${m.row},${m.col}`));
 
+  let dragSet = null;
+  if (dragSource) {
+    dragMoves = getLegalMoves(board, dragSource.row, dragSource.col, castling, enPassant);
+    dragSet = new Set(dragMoves.map(m => `${m.row},${m.col}`));
+  }
+
   for (let r = 0; r < 8; r++) {
     for (let c = 0; c < 8; c++) {
       const sq = document.createElement('div');
@@ -846,11 +914,33 @@ function renderBoard() {
       let cls = `square ${base}`;
       if (selected && selected.row === r && selected.col === c) cls += ' selected';
       if (legalSet.has(`${r},${c}`)) cls += board[r][c] ? ' legal-capture' : ' legal-move';
+      if (dragSet && dragSet.has(`${r},${c}`)) cls += board[r][c] ? ' legal-capture' : ' legal-move';
       if (inCheck && board[r][c] && board[r][c].type === 'K' && board[r][c].color === turn) cls += ' in-check';
       sq.className = cls;
       sq.style.gridRow = String(r + 2);
       sq.style.gridColumn = String(c + 2);
       sq.addEventListener('click', () => handleClick(r, c));
+      sq.addEventListener('dragover', (e) => e.preventDefault());
+      sq.addEventListener('dragenter', (e) => {
+        e.preventDefault();
+        if (dragSource && dragMoves.some(m => m.row === r && m.col === c))
+          sq.classList.add('drag-hover');
+      });
+      sq.addEventListener('dragleave', () => {
+        sq.classList.remove('drag-hover');
+      });
+      sq.addEventListener('drop', (e) => {
+        e.preventDefault();
+        sq.classList.remove('drag-hover');
+        if (!dragSource) return;
+        const from = dragSource;
+        const moves = dragMoves;
+        dragSource = null;
+        dragMoves = [];
+        const isLegal = moves.some(m => m.row === r && m.col === c);
+        if (isLegal) executeMove(from.row, from.col, r, c);
+        else renderBoard();
+      });
 
       if (board[r][c]) {
         const span = document.createElement('span');
@@ -858,6 +948,42 @@ function renderBoard() {
         span.textContent = UNICODE[board[r][c].type][board[r][c].color];
         sq.appendChild(span);
       }
+
+      if (board[r][c] && board[r][c].color === turn && !gameOver) {
+        sq.draggable = true;
+        sq.addEventListener('dragstart', (e) => {
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', `${r},${c}`);
+          const pieceEl = sq.querySelector('.piece');
+          if (pieceEl) {
+            const clone = pieceEl.cloneNode(true);
+            clone.style.position = 'absolute';
+            clone.style.top = '-9999px';
+            clone.style.fontSize = getComputedStyle(pieceEl).fontSize;
+            clone.style.filter = 'drop-shadow(0 2px 4px rgba(0,0,0,0.5))';
+            document.body.appendChild(clone);
+            e.dataTransfer.setDragImage(clone, 24, 24);
+            setTimeout(() => document.body.removeChild(clone), 0);
+          }
+          dragSource = { row: r, col: c };
+          selected = null;
+          legalMoves = [];
+          setTimeout(() => {
+            sq.classList.add('dragging');
+            renderBoard();
+          }, 0);
+        });
+        sq.addEventListener('dragend', () => {
+          sq.classList.remove('dragging');
+          document.querySelectorAll('.square.drag-hover').forEach(el => el.classList.remove('drag-hover'));
+          if (dragSource) {
+            dragSource = null;
+            dragMoves = [];
+            renderBoard();
+          }
+        });
+      }
+
       wrapper.appendChild(sq);
     }
   }
@@ -865,6 +991,14 @@ function renderBoard() {
 
 function initGame() {
   hideLoading();
+  searching = false;
+  stockfishCallback = null;
+  dragSource = null;
+  dragMoves = [];
+  if (engineReady) {
+    engine.postMessage('ucinewgame');
+    engine.postMessage('setoption name Skill Level value ' + stockfishSkill);
+  }
   board = Array(8).fill(null).map(() => Array(8).fill(null));
   const back = ['R', 'N', 'B', 'Q', 'K', 'B', 'N', 'R'];
   for (let c = 0; c < 8; c++) {
@@ -889,14 +1023,16 @@ function initGame() {
 document.getElementById('resetBtn').addEventListener('click', initGame);
 document.getElementById('undoBtn').addEventListener('click', undo);
 document.getElementById('depthSlider').addEventListener('input', function () {
-  aiDepth = parseInt(this.value);
+  stockfishSkill = parseInt(this.value);
   document.getElementById('depthValue').textContent = this.value;
+  if (engineReady) engine.postMessage('setoption name Skill Level value ' + stockfishSkill);
 });
 
-document.getElementById('depthSlider').value = 3;
-aiDepth = 3;
-document.getElementById('depthValue').textContent = '3';
+document.getElementById('depthSlider').value = 10;
+stockfishSkill = 10;
+document.getElementById('depthValue').textContent = '10';
 
+initStockfish();
 initGame();
 </script>
 </body>
